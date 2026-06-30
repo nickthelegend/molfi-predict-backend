@@ -294,11 +294,44 @@ async function resolveDueOnChain() {
   }
 }
 
-// Run create + resolve sequentially in one tick so we never race the keeper's
-// own transaction sequence number.
+// Keep the confidential-bet pool solvent: a winning claim pays 2× the denom from
+// a shared pot, so the pool needs standing liquidity. Top it up with keeper-funded
+// notes when it dips. These notes ONLY fund the pot — claim soundness is enforced
+// per-claim by the registered Merkle root + the ZK proof, not by these deposits.
+const CONF_POT_MIN = 400 * U;
+const CONF_POT_TARGET = 1000 * U;
+async function ensureConfPot() {
+  if (!KEEPER) return;
+  try {
+    const pot = Number(await readChain(CONF_BET_C, "pot"));
+    if (pot >= CONF_POT_MIN) return;
+    const denom = Number(await readChain(CONF_BET_C, "denom")) || 100 * U;
+    const notes = Math.ceil((CONF_POT_TARGET - pot) / denom);
+    const me = new Address(KEEPER.publicKey()).toScVal();
+    const bal = Number(await readChain(MUSDC_C, "balance", [me]).catch(() => 0));
+    if (bal < notes * denom) await writeChain(MUSDC_C, "faucet", [me]);
+    for (let i = 0; i < notes; i++) {
+      await writeChain(CONF_BET_C, "commit", [me, bytesScVal(randomBytes(32).toString("hex"))]);
+    }
+    console.log(`[keeper] funded confidential pool +${notes} notes → ~${CONF_POT_TARGET / U} mUSDC`);
+  } catch (e) {
+    console.error("[keeper] ensureConfPot:", e.message);
+  }
+}
+
+// Run steps sequentially in one tick — and never overlap ticks — so we don't race
+// the keeper's own transaction sequence number.
+let keeperBusy = false;
 async function keeperTick() {
-  await ensureOnChainMarkets();
-  await resolveDueOnChain();
+  if (keeperBusy) return;
+  keeperBusy = true;
+  try {
+    await ensureConfPot();
+    await ensureOnChainMarkets();
+    await resolveDueOnChain();
+  } finally {
+    keeperBusy = false;
+  }
 }
 if (KEEPER) {
   console.log("[keeper] on-chain market keeper active:", KEEPER.publicKey());
