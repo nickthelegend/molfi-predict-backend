@@ -1,0 +1,26 @@
+[
+  {
+    "marketId": "0c0a0000000000000000000000000000000000000000000000000000043a95b9",
+    "symbol": "BTC",
+    "question": "Will BTC be above its current price at close? (on-chain · Reflector · 30m)",
+    "closeTs": 1782792604000,
+    "oracle": "reflector",
+    "resolved": false
+  },
+  {
+    "marketId": "0c0a000000000000000000000000000000000000000000000000000025036b74",
+    "symbol": "ETH",
+    "question": "Will ETH be above its current price at close? (on-chain · Reflector · 30m)",
+    "closeTs": 1782792604000,
+    "oracle": "reflector",
+    "resolved": false
+  },
+  {
+    "marketId": "0c0a000000000000000000000000000000000000000000000000000001c56f07",
+    "symbol": "SOL",
+    "question": "Will SOL be above its current price at close? (on-chain · Reflector · 30m)",
+    "closeTs": 1782792604000,
+    "oracle": "reflector",
+    "resolved": false
+  }
+]
