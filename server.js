@@ -11,7 +11,7 @@
 import express from "express";
 import { MongoClient } from "mongodb";
 import { readFileSync } from "fs";
-import { randomBytes } from "crypto";
+import { randomBytes, createHash } from "crypto";
 import { groth16 } from "snarkjs";
 import {
   rpc,
@@ -62,6 +62,8 @@ const OnchainTrades = db.collection("onchainTrades"); // real predict-escrow bet
 const Meta = db.collection("meta");
 await OnchainTrades.createIndex({ address: 1 });
 await OnchainTrades.createIndex({ kind: 1 });
+const Comments = db.collection("comments"); // market chat (text/gif/image; images pinned to IPFS via Pinata)
+await Comments.createIndex({ marketId: 1, ts: -1 });
 
 // ── On-chain layer: read Soroban contracts + index real escrow events ─────────
 const RPC_URL = process.env.MOLFI_RPC_URL || "https://soroban-testnet.stellar.org";
@@ -158,6 +160,12 @@ const MARKET_C = process.env.MOLFI_MARKET || "CDDX7ELEU2XBQWYYS72BFKZN5M642EBLEA
 const REFLECTOR =
   process.env.MOLFI_REFLECTOR || "CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63";
 const KEEPER = process.env.MOLFI_ADMIN_SECRET ? Keypair.fromSecret(process.env.MOLFI_ADMIN_SECRET) : null;
+// Confidential betting (hidden side via commitment notes + on-chain ZK claim).
+const CONF_BET_C =
+  process.env.MOLFI_CONF_BET || "CBJO7AZHJSS4JZFTFYHZWK7B2ZZNZ4OUQMAZ53YAJCMJB3M7HHHISJXA";
+const CONF_CIRCUIT = "../molfi-circuits/build/confidential_bet";
+const CONF_DENOM = 100; // fixed uniform denomination (mUSDC) — hides the amount
+const CONF_PAYOUT = 200; // PAYOUT_MULT(2) × denom on a winning claim
 // Tokens with BOTH a Reflector feed and a Coinbase chart (so cards are rich).
 const OC_TOKENS = ["BTC", "ETH", "SOL", "XLM", "LINK", "AVAX"];
 const OC_CADENCES = [15, 30]; // minutes — auto-rolling 15m AND 30m markets per token
@@ -178,24 +186,36 @@ const bytesScVal = (hex) => nativeToScVal(Buffer.from(hex, "hex"), { type: "byte
 const assetOther = (sym) => xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("Other"), xdr.ScVal.scvSymbol(sym)]);
 const randId = () => "0c0a" + randomBytes(30).toString("hex"); // 64-hex BytesN<32>
 
-/** Sign + submit a state-changing call as the keeper, await success, return hash. */
+/** Sign + submit a state-changing call as the keeper, await success, return hash.
+ * Serialized through a single lock: the keeper tick and the confidential-claim
+ * endpoint both sign with the same admin key, so concurrent calls would otherwise
+ * collide on the source-account sequence number (txBadSeq). */
+let _chainLock = Promise.resolve();
 async function writeChain(contractId, method, args) {
-  const acct = await SOROBAN.getAccount(KEEPER.publicKey());
-  const tx = new TransactionBuilder(acct, { fee: BASE_FEE, networkPassphrase: Networks.TESTNET })
-    .addOperation(new Contract(contractId).call(method, ...args))
-    .setTimeout(60)
-    .build();
-  const prepared = await SOROBAN.prepareTransaction(tx);
-  prepared.sign(KEEPER);
-  const sent = await SOROBAN.sendTransaction(prepared);
-  if (sent.status === "ERROR") throw new Error(JSON.stringify(sent.errorResult));
-  let got = await SOROBAN.getTransaction(sent.hash);
-  for (let i = 0; i < 30 && got.status === "NOT_FOUND"; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    got = await SOROBAN.getTransaction(sent.hash);
-  }
-  if (got.status !== "SUCCESS") throw new Error(`tx ${got.status}`);
-  return sent.hash;
+  const run = async () => {
+    const acct = await SOROBAN.getAccount(KEEPER.publicKey());
+    const tx = new TransactionBuilder(acct, { fee: BASE_FEE, networkPassphrase: Networks.TESTNET })
+      .addOperation(new Contract(contractId).call(method, ...args))
+      .setTimeout(60)
+      .build();
+    const prepared = await SOROBAN.prepareTransaction(tx);
+    prepared.sign(KEEPER);
+    const sent = await SOROBAN.sendTransaction(prepared);
+    if (sent.status === "ERROR") throw new Error(JSON.stringify(sent.errorResult));
+    let got = await SOROBAN.getTransaction(sent.hash);
+    for (let i = 0; i < 30 && got.status === "NOT_FOUND"; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      got = await SOROBAN.getTransaction(sent.hash);
+    }
+    if (got.status !== "SUCCESS") throw new Error(`tx ${got.status}`);
+    return sent.hash;
+  };
+  const result = _chainLock.then(run, run);
+  _chainLock = result.then(
+    () => {},
+    () => {},
+  );
+  return result;
 }
 
 /** Ensure each token has one open on-chain Reflector market (>5 min to close). */
@@ -442,9 +462,172 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
-app.use(express.json());
+app.use(express.json({ limit: "8mb" })); // 8mb: base64 image uploads for market chat
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, prices: lastPrice }));
+
+// ── Market chat: comments (text / emoji / GIF / image) — images pinned to IPFS ──
+const PINATA_JWT = process.env.PINATA_JWT || "";
+const PINATA_GATEWAY = (process.env.PINATA_GATEWAY || "https://gateway.pinata.cloud").replace(/\/$/, "");
+
+/** Pin a file buffer to IPFS via Pinata; returns its CID + gateway URL. */
+async function pinataUpload(buffer, filename, contentType) {
+  if (!PINATA_JWT) throw new Error("Pinata not configured");
+  const fd = new FormData();
+  fd.append("file", new Blob([buffer], { type: contentType }), filename);
+  fd.append("pinataMetadata", JSON.stringify({ name: filename, keyvalues: { app: "molfi" } }));
+  const r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${PINATA_JWT}` },
+    body: fd,
+  });
+  if (!r.ok) throw new Error(`Pinata ${r.status}: ${await r.text()}`);
+  const j = await r.json();
+  return { cid: j.IpfsHash, url: `${PINATA_GATEWAY}/ipfs/${j.IpfsHash}` };
+}
+
+const cleanText = (s) => String(s || "").slice(0, 2000);
+const commentKind = (t) => (t === "gif" ? "gif" : t === "image" ? "image" : "text");
+function serializeComment(d) {
+  return {
+    id: d._id,
+    address: d.address,
+    type: d.type,
+    text: d.text || "",
+    path: d.path || "",
+    likes: d.likes || [],
+    ts: d.ts,
+    replies: (d.replies || []).map((r) => ({
+      id: r.id,
+      address: r.address,
+      type: r.type,
+      text: r.text || "",
+      path: r.path || "",
+      likes: r.likes || [],
+      ts: r.ts,
+    })),
+  };
+}
+
+// Upload an image to IPFS via Pinata (base64 data URL in JSON) → gateway URL.
+app.post("/api/pinata/upload", async (req, res) => {
+  try {
+    const { dataUrl, filename } = req.body || {};
+    const m = /^data:([^;]+);base64,(.+)$/.exec(String(dataUrl || ""));
+    if (!m) return res.status(400).json({ error: "expected a base64 image data URL" });
+    if (!m[1].startsWith("image/")) return res.status(400).json({ error: "images only" });
+    const buf = Buffer.from(m[2], "base64");
+    if (buf.length > 6 * 1024 * 1024) return res.status(413).json({ error: "image too large (max 6MB)" });
+    res.json(await pinataUpload(buf, filename || `molfi-${Date.now()}.img`, m[1]));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// List a market's comments (newest first).
+app.get("/api/markets/:id/comments", async (req, res) => {
+  try {
+    const lim = Math.min(Number(req.query.limit) || 20, 100);
+    const rows = await Comments.find({ marketId: req.params.id }).sort({ ts: -1 }).limit(lim).toArray();
+    res.json(rows.map(serializeComment));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Post a comment (text / gif / image). `path` is the GIF id or IPFS gateway URL.
+app.post("/api/markets/:id/comments", async (req, res) => {
+  try {
+    const { address, type, text, path } = req.body || {};
+    if (!address) return res.status(400).json({ error: "address required" });
+    const kind = commentKind(type);
+    if (kind === "text" && !cleanText(text).trim()) return res.status(400).json({ error: "empty comment" });
+    if (kind !== "text" && !path) return res.status(400).json({ error: "path required" });
+    const doc = {
+      _id: randomBytes(12).toString("hex"),
+      marketId: req.params.id,
+      address: String(address),
+      type: kind,
+      text: cleanText(text),
+      path: kind === "text" ? "" : String(path),
+      likes: [],
+      replies: [],
+      ts: Date.now(),
+    };
+    await Comments.insertOne(doc);
+    res.json(serializeComment(doc));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Toggle a like on a comment.
+app.post("/api/comments/:id/like", async (req, res) => {
+  try {
+    const { address, liked } = req.body || {};
+    if (!address) return res.status(400).json({ error: "address required" });
+    await Comments.updateOne(
+      { _id: req.params.id },
+      liked ? { $pull: { likes: address } } : { $addToSet: { likes: address } },
+    );
+    const doc = await Comments.findOne({ _id: req.params.id });
+    res.json(doc ? serializeComment(doc) : {});
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Reply to a comment.
+app.post("/api/comments/:id/reply", async (req, res) => {
+  try {
+    const { address, type, text, path } = req.body || {};
+    if (!address) return res.status(400).json({ error: "address required" });
+    const kind = commentKind(type);
+    const reply = {
+      id: randomBytes(8).toString("hex"),
+      address: String(address),
+      type: kind,
+      text: cleanText(text),
+      path: kind === "text" ? "" : String(path || ""),
+      likes: [],
+      ts: Date.now(),
+    };
+    await Comments.updateOne({ _id: req.params.id }, { $push: { replies: reply } });
+    const doc = await Comments.findOne({ _id: req.params.id });
+    res.json(doc ? serializeComment(doc) : {});
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete your own comment.
+app.delete("/api/comments/:id", async (req, res) => {
+  try {
+    const address = req.query.address || req.body?.address;
+    const doc = await Comments.findOne({ _id: req.params.id });
+    if (!doc) return res.json({ ok: true });
+    if (doc.address !== address) return res.status(403).json({ error: "not your comment" });
+    await Comments.deleteOne({ _id: req.params.id });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete your own reply.
+app.delete("/api/comments/:id/replies/:replyId", async (req, res) => {
+  try {
+    const address = req.query.address || req.body?.address;
+    const doc = await Comments.findOne({ _id: req.params.id });
+    if (!doc) return res.json({ ok: true });
+    const reply = (doc.replies || []).find((r) => r.id === req.params.replyId);
+    if (reply && reply.address !== address) return res.status(403).json({ error: "not your reply" });
+    await Comments.updateOne({ _id: req.params.id }, { $pull: { replies: { id: req.params.replyId } } });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // Bridge: on-chain market ids (32-byte hex) that SDK agents can bet on via the
 // predict-escrow contract. Populated by molfi-contracts/scripts/seed_onchain_markets.sh.
@@ -564,6 +747,78 @@ app.get("/api/zk/proof", async (_req, res) => {
       proof: { a: g1(proof.pi_a), b: g2(proof.pi_b), c: g1(proof.pi_c) },
       domain: fr(publicSignals[0]),
       publicInputs: publicSignals.slice(1).map(fr),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Confidential betting: hidden commitment note → on-chain ZK claim ───────────
+// The side + owner stay hidden. commit() escrows a uniform 100 mUSDC denomination
+// (amount hidden); claim() proves IN ZERO KNOWLEDGE that the note backs the
+// resolved winning outcome (the contract injects the winner as a public input, so
+// a losing note's proof can't verify) and pays out — unlinkable to the deposit.
+const confField = () => BigInt("0x" + randomBytes(31).toString("hex")).toString();
+app.post("/api/confidential/prepare-commit", (req, res) => {
+  try {
+    const side = String(req.body?.side || "YES").toUpperCase();
+    const outcome = side === "NO" ? 1 : 0;
+    const note = { secret: confField(), nullifier: confField(), outcome, recipient: confField() };
+    // On-chain record: a binding hash of the note (reveals nothing about the side).
+    const commitment = createHash("sha256")
+      .update([note.secret, note.nullifier, String(note.outcome), note.recipient].join("|"))
+      .digest("hex");
+    res.json({ note, commitment, denom: CONF_DENOM, side: outcome === 0 ? "YES" : "NO" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/confidential/prepare-claim", async (req, res) => {
+  try {
+    const { note, marketId } = req.body || {};
+    if (!note || !marketId) return res.status(400).json({ error: "note + marketId required" });
+    let resolved = false;
+    try {
+      resolved = Boolean(await readChain(MARKET_C, "is_resolved", [bytesScVal(marketId)]));
+    } catch {
+      resolved = false;
+    }
+    if (!resolved) return res.json({ resolved: false });
+    const winner = Number(await readChain(MARKET_C, "winning_outcome", [bytesScVal(marketId)]));
+    // A note that backed the losing side can't produce a proof the contract accepts
+    // (the verifier checks the proof's outcome == the injected winner). Tell the
+    // user up front instead of burning a guaranteed-to-revert claim tx.
+    if (Number(note.outcome) !== winner) {
+      return res.json({ resolved: true, won: false, winningOutcome: winner });
+    }
+    // Build the Groth16 proof from the user's COMMITTED note (outcome = its real
+    // side). The dummy Merkle path stands in for the off-chain accumulator.
+    const input = {
+      secret: String(note.secret),
+      nullifier: String(note.nullifier),
+      outcome: String(note.outcome),
+      recipient: String(note.recipient),
+      pathElements: ["1", "2", "3", "4", "5", "6", "7", "8"],
+      pathIndices: ["0", "1", "0", "1", "0", "0", "1", "0"],
+    };
+    const { proof, publicSignals } = await groth16.fullProve(
+      input,
+      `${CONF_CIRCUIT}/confidential_bet_js/confidential_bet.wasm`,
+      `${CONF_CIRCUIT}/final.zkey`,
+    );
+    const root = fr(publicSignals[0]);
+    // Admin checkpoints this root so the contract recognizes it at claim time.
+    await writeChain(CONF_BET_C, "register_root", [bytesScVal(root)]);
+    res.json({
+      resolved: true,
+      won: true,
+      winningOutcome: winner,
+      payout: CONF_PAYOUT,
+      proof: { a: g1(proof.pi_a), b: g2(proof.pi_b), c: g1(proof.pi_c) },
+      root,
+      nullifierHash: fr(publicSignals[1]),
+      recipientField: fr(publicSignals[3]),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
